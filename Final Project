@@ -1,0 +1,172 @@
+#Data and code is originally from:
+#https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi%3A10.7910%2FDVN%2FQ0WIGS
+
+#Synthetic Control Method:
+#source("src/analysis-synth.R", echo=T) #this runs the file called "analysis-synth.R".
+
+##### Synthetic control case study:  Turkey
+
+#### Setup
+
+library(foreign)
+
+rm(list=ls())
+
+#### Load and merge data
+
+## Load Google data for cases that use mechanism
+google <- read.dta("data/merged-imputed/main.dta")
+
+## Load in newer google request data
+google.new <- read.csv("data/Googletakedowns/google-requests-20150608.csv",
+                       head=T)
+
+## Drop countries in new data that aren't in old (non-democracies, mostly)
+country.in <- google.new$CLDR.Territory.Code %in% google$cldrterritorycode
+google.new <- google.new[country.in, ]
+
+### Merge
+tmp <- data.frame(matrix(NA, nrow=nrow(google.new), ncol=ncol(google)))
+names(tmp) <- names(google)
+google <- rbind(google, tmp)
+start <- nrow(google) - nrow(tmp) + 1
+google$country[start:nrow(google)] <- as.character(google.new$Country)
+google$cldrterritorycode[start:nrow(google)] <- as.character(google.new$CLDR.Territory.Code)
+google$requests[start:nrow(google)] <- google.new$All.Requests..Number.of.Requests
+google$year[start:nrow(google)] <- google.new$Year
+google$Half[start:nrow(google)] <- google.new$Half
+
+## Fill in request NA (where random) with avg imputed
+avg.imputed <- apply(google[,paste("_", 1:20, "_req2", sep="")], 1, mean)
+google$requests[which(google$random==1)] <- avg.imputed[which(google$random==1)]
+
+## Fill in missing zeros
+trow <- data.frame(matrix(NA, nrow=1, ncol=ncol(google)))
+names(trow) <- names(google)
+
+for (y in 2009:2013) {
+  for (h in 1:2) {
+    for (c in unique(google$cldrterritorycode)) {
+      if (!(y == 2009 & h == 1)) {
+        if (sum(with(google, year==y & Half==h & cldrterritorycode==c)) == 0) {
+          google <- rbind(google, trow)
+          google[nrow(google), c("cldrterritorycode", "requests", "year", "Half")] <- c(c, 0, y, h)
+        }
+      }
+    }
+  }
+}
+
+## Sort by country, then year, then half
+google <- google[order(google$cldrterritorycode, google$year, google$Half),]
+
+## Fill in time var
+google$Time <- rep(1:9, nrow(google)/9)
+
+## Drop a few cases with tons of missing data
+google <- google[!google$cldrterritorycode=="CY",] # cyprus
+google <- google[!google$cldrterritorycode=="AR",] # argentina
+google <- google[!google$cldrterritorycode=="TT",] # trinidad
+google <- google[!google$cldrterritorycode=="SB",] # solomon islands
+google <- google[!google$cldrterritorycode=="BO",] # bolivia
+google <- google[!google$cldrterritorycode=="PA",] # panama
+google <- google[!google$cldrterritorycode=="SK",] # slovakia
+google <- google[!google$cldrterritorycode=="SI",] # slovenia
+google <- google[!google$cldrterritorycode=="PL",] # poland
+google <- google[!google$cldrterritorycode=="MU",] # mauritius
+google <- google[!google$cldrterritorycode=="MT",] # malta
+google <- google[!google$cldrterritorycode=="LT",] # lithuania
+
+
+#### Actual Synthetic matching
+library(Synth)
+
+### Data prep
+## We drop google market share because it has little variation
+google$cldrcode <- as.numeric(as.factor(google$cldrterritorycode))
+turkey.code <- google$cldrcode[google$cldrterritorycode=="TR"][1]
+google$requests <- as.numeric(google$requests)
+google.dp <- dataprep(
+  foo = google,
+  predictors = c("netpc10k", #"Googlemarketshare",
+                 "loggdppc", "logpap", "loggtdi",
+                 "Timerequiredtostartabusines", "logdm_dpi"),
+  time.predictors.prior = 1:4,
+  dependent = "requests",
+  unit.variable = "cldrcode",
+  time.variable = "Time",
+  unit.names.variable = "cldrterritorycode",
+  treatment.identifier = turkey.code,
+  controls.identifier = c(1:(turkey.code-1),
+                          (turkey.code+1):max(unique(google$cldrcode))),
+  time.optimize.ssr = 1:4,
+  time.plot = 1:9)
+
+### Set up synthetic control case
+google.synth <- synth(google.dp)
+
+### Tables
+google.tab <- synth.tab(google.synth, google.dp)
+
+## Table 5 in appendix
+google.tab$tab.pred
+
+## Table 6 in appendix
+google.tab$tab.w[google.tab$tab.w$w.weights > 0.01,]
+
+### Figure 2 in the main text 
+
+## Path plot
+par(mfrow=c(1,2))
+path.plot(google.synth, google.dp, Ylim=c(0, 1700), Xlab="Half-Year",
+          Ylab="Takedown Requests", Main="Takedown Request Trends",
+          Legend=NA)
+abline(v=5, col="gray", lty=2)
+legend(0.5 ,1650, c("Turkey", "Synthetic Turkey"), lty=c(1,2), bty="n",
+       cex=0.6)
+
+## Placebo tests, gaps plot.
+
+gaps<-sapply (1:max(google$cldrcode), function (i) {
+  print(i)
+  dp <- dataprep(
+    foo = google,
+    predictors = c("netpc10k", #"Googlemarketshare",
+                   "loggdppc", "logpap", "loggtdi",
+                   "Timerequiredtostartabusines", "logdm_dpi"),
+    time.predictors.prior = 1:4,
+    dependent = "requests",
+    unit.variable = "cldrcode",
+    time.variable = "Time",
+    unit.names.variable = "cldrterritorycode",
+    treatment.identifier = i,
+    controls.identifier = (1:max(unique(google$cldrcode)))[-i],
+    time.optimize.ssr = 1:4,
+    time.plot = 1:9)
+  
+  synth.out <- tryCatch(synth(dp, method="BFGS"),
+                        error = function (e)
+                          matrix(NA, nrow=9, ncol=1))
+  if (is.matrix(synth.out))
+    return(synth.out)
+  else
+    return(dp$Y1plot - (dp$Y0plot %*% synth.out$solution.w))
+})
+
+plot(1:9, gaps[,turkey.code], ylim=c(-1700,1700), type='l',
+     xlab="Half-Year", ylab="Gaps in Takedown Requests",
+     main="Permutation Test of Takedown Request Gaps")
+abline(h=0, lty=2, lwd=2)
+abline(v=5, lty=2, col="gray")
+for (i in 1:max(unique(google$cldrcode)))
+  points(gaps[,i], col="gray", type='l')
+points(gaps[,turkey.code], type='l', lwd=2)
+legend(0.5 ,1650, c("Turkey", "Control States"), lty=1, col=c("black", "gray"),
+       bty="n", cex=0.6)
+
+
+#Leave-One-Out - Colombia:
+Add in line 79: google <- google[!google$cldrterritorycode=="CO",] # Colombia
+
+#Leave-One-Out - Portugal:
+Replace line 79: google <- google[!google$cldrterritorycode=="PT",] # Portugal
